@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 interface City {
   id: number;
@@ -6,6 +7,11 @@ interface City {
   latitude: number;
   longitude: number;
   country: string;
+  admin1?: string;
+}
+
+interface CachedCity extends City {
+  admin1?: string;
 }
 
 interface WeatherData {
@@ -30,9 +36,13 @@ interface LocationData {
   isCurrent: boolean;
 }
 
-// Helper function to convert weather code to emoji
+interface CachedWeatherData {
+  city: CachedCity;
+  weather_json: string;
+  timestamp: number;
+}
+
 function getWeatherEmoji(weatherCode: number, isDay: boolean): string {
-  // Based on WMO Weather interpretation codes
   if (weatherCode === 0) return isDay ? "☀️" : "🌙";
   if (weatherCode === 1 || weatherCode === 2) return "🌤️";
   if (weatherCode === 3) return "☁️";
@@ -45,28 +55,18 @@ function getWeatherEmoji(weatherCode: number, isDay: boolean): string {
   return "🌤️";
 }
 
-// Helper to get gradient based on weather
-function getGradient(
-  weatherCode: number,
-  isDay: boolean
-): string {
+function getGradient(weatherCode: number, isDay: boolean): string {
   if (weatherCode === 0 && isDay) {
-    // Clear/sunny day
     return "bg-gradient-to-br from-blue-400 to-yellow-300";
   } else if (weatherCode === 0 && !isDay) {
-    // Clear night
     return "bg-gradient-to-br from-gray-800 to-purple-900";
   } else if ([1, 2, 3].includes(weatherCode)) {
-    // Partly cloudy
     return "bg-gradient-to-br from-blue-300 to-gray-400";
   } else if ([45, 48, 51, 53, 55, 61, 63, 65, 80, 81, 82].includes(weatherCode)) {
-    // Rainy
     return "bg-gradient-to-br from-slate-500 to-blue-600";
   } else if ([71, 73, 75, 77, 85, 86].includes(weatherCode)) {
-    // Snowy
     return "bg-gradient-to-br from-cyan-200 to-blue-300";
   } else if ([95, 96, 99].includes(weatherCode)) {
-    // Thunderstorm
     return "bg-gradient-to-br from-gray-800 to-purple-700";
   }
 
@@ -83,6 +83,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [locationName, setLocationName] = useState("Loading...");
+  const [cachedCities, setCachedCities] = useState<CachedWeatherData[]>([]);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
 
   // Browser geolocation on startup
   useEffect(() => {
@@ -91,24 +93,28 @@ function App() {
         (pos) => {
           const { latitude, longitude } = pos.coords;
           setLocation({ latitude, longitude, isCurrent: true });
-          fetchWeatherData(latitude, longitude);
         },
         () => {
-          // Fallback to a default location (New York)
+          // Fallback to NYC
           setLocation({ latitude: 40.7128, longitude: -74.006, isCurrent: false });
-          fetchWeatherData(40.7128, -74.006);
         }
       );
     }
+    loadCachedCities();
   }, []);
 
-  // Fetch weather data from Open-Meteo
+  // Centralized fetch on location or unit change
+  useEffect(() => {
+    if (location) {
+      fetchWeatherData(location.latitude, location.longitude);
+    }
+  }, [location, isFahrenheit]);
+
   async function fetchWeatherData(lat: number, lon: number) {
     try {
       setLoading(true);
       setError("");
 
-      // Fetch current weather
       const weatherRes = await fetch(
         `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,weather_code,is_day,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=${isFahrenheit ? "fahrenheit" : "celsius"}&wind_speed_unit=kmh&forecast_days=8`
       );
@@ -117,33 +123,33 @@ function App() {
       const data = await weatherRes.json();
 
       const current = data.current;
-      setWeather({
+      const weatherData: WeatherData = {
         temperature: current.temperature_2m,
         humidity: current.relative_humidity_2m,
         windSpeed: current.wind_speed_10m,
         weatherCode: current.weather_code,
         isDay: current.is_day === 1,
         isFahrenheit,
-      });
+      };
+      setWeather(weatherData);
 
-      // Process forecast
       const forecastData = data.daily.time.slice(1, 8).map((date: string, idx: number) => ({
         date,
         maxTemp: data.daily.temperature_2m_max[idx + 1],
         minTemp: data.daily.temperature_2m_min[idx + 1],
         weatherCode: data.daily.weather_code[idx + 1],
       }));
-
       setForecast(forecastData);
 
-      // Try to get location name from reverse geocoding
+      // Get location name and cache if from a searched city
       try {
         const geoRes = await fetch(
           `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`
         );
         if (geoRes.ok) {
           const geoData = await geoRes.json();
-          setLocationName(geoData.address?.city || geoData.address?.town || "Unknown Location");
+          const city_name = geoData.address?.city || geoData.address?.town || "Unknown Location";
+          setLocationName(city_name);
         }
       } catch {
         setLocationName("Unknown Location");
@@ -156,7 +162,21 @@ function App() {
     }
   }
 
-  // Search for cities
+  async function loadCachedCities() {
+    try {
+      const cached = await invoke<CachedWeatherData[]>("get_cached");
+      setCachedCities(cached);
+    } catch (err) {
+      console.error("Failed to load cached cities:", err);
+    }
+  }
+
+  async function selectCity(city: City) {
+    setLocation({ latitude: city.latitude, longitude: city.longitude, isCurrent: false });
+    setSearchQuery("");
+    setSearchResults([]);
+  }
+
   async function handleCitySearch(query: string) {
     setSearchQuery(query);
     if (query.length < 2) {
@@ -172,27 +192,56 @@ function App() {
         const data = await res.json();
         setSearchResults(data.results || []);
       }
-    } catch (err) {
+    } catch {
       setSearchResults([]);
     }
   }
 
-  // Select a city from search results
-  function selectCity(city: City) {
-    setLocation({ latitude: city.latitude, longitude: city.longitude, isCurrent: false });
-    setLocationName(`${city.name}, ${city.country}`);
-    setSearchQuery("");
-    setSearchResults([]);
-    fetchWeatherData(city.latitude, city.longitude);
+  async function handleCacheCity(city: City) {
+    if (!weather) return;
+
+    try {
+      const cachedCity: CachedCity = {
+        id: city.id,
+        name: city.name,
+        latitude: city.latitude,
+        longitude: city.longitude,
+        country: city.country,
+        admin1: city.admin1,
+      };
+
+      const weatherJson = JSON.stringify(weather);
+      await invoke("upsert_cached", { city: cachedCity, weatherJson });
+      await loadCachedCities();
+    } catch (err) {
+      console.error("Failed to cache city:", err);
+    }
   }
 
-  // Toggle temperature unit
-  function toggleUnit() {
-    const newUnit = !isFahrenheit;
-    setIsFahrenheit(newUnit);
-    if (location) {
-      fetchWeatherData(location.latitude, location.longitude);
+  async function removeCachedCity(cachedData: CachedWeatherData) {
+    try {
+      await invoke("remove_cached", {
+        id: cachedData.city.id,
+        latitude: cachedData.city.latitude,
+        longitude: cachedData.city.longitude,
+      });
+      await loadCachedCities();
+    } catch (err) {
+      console.error("Failed to remove cached city:", err);
     }
+  }
+
+  async function loadCachedCity(cachedData: CachedWeatherData) {
+    setLocation({
+      latitude: cachedData.city.latitude,
+      longitude: cachedData.city.longitude,
+      isCurrent: false,
+    });
+    setLocationName(`${cachedData.city.name}, ${cachedData.city.country}`);
+  }
+
+  function toggleUnit() {
+    setIsFahrenheit(!isFahrenheit);
   }
 
   const gradient = weather
@@ -202,10 +251,11 @@ function App() {
   return (
     <div className={`min-h-screen ${gradient} transition-all duration-500 p-4 md:p-8`}>
       <div className="max-w-4xl mx-auto">
-        {/* Header with title and toggle */}
+        {/* Header */}
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-4xl md:text-5xl font-bold text-white drop-shadow-lg">Weather</h1>
           <button
+            type="button"
             onClick={toggleUnit}
             className="bg-white/20 hover:bg-white/30 text-white px-6 py-2 rounded-full font-semibold backdrop-blur transition-all"
           >
@@ -224,19 +274,99 @@ function App() {
           />
           {/* Search results dropdown */}
           {searchResults.length > 0 && (
-            <div className="absolute top-full left-0 right-0 mt-2 bg-white/95 backdrop-blur rounded-lg shadow-xl z-10">
+            <div className="absolute top-full left-0 right-0 mt-2 bg-white/95 backdrop-blur rounded-lg shadow-xl z-10 max-h-72 overflow-y-auto">
               {searchResults.map((city) => (
-                <button
-                  key={city.id}
-                  onClick={() => selectCity(city)}
-                  className="w-full text-left px-6 py-3 hover:bg-blue-100 transition-colors text-gray-800 border-b last:border-b-0"
+                <div
+                  key={`${city.id}_${city.latitude}_${city.longitude}`}
+                  className="flex items-center justify-between px-6 py-4 hover:bg-blue-100 transition-colors border-b last:border-b-0"
                 >
-                  {city.name}, {city.country}
-                </button>
+                  <div className="flex-1 text-left">
+                    <div className="text-gray-800 font-medium">
+                      {city.name}
+                      {city.admin1 && <span className="text-gray-600 text-sm"> - {city.admin1}</span>}
+                    </div>
+                    <div className="text-gray-600 text-xs">
+                      {city.country} • {city.latitude.toFixed(2)}, {city.longitude.toFixed(2)}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => selectCity(city)}
+                    className="ml-4 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors text-sm font-medium"
+                  >
+                    Load
+                  </button>
+                </div>
               ))}
             </div>
           )}
         </div>
+
+        {/* History Panel */}
+        {cachedCities.length > 0 && (
+          <div className="mb-8 bg-white/10 backdrop-blur rounded-3xl overflow-hidden shadow-2xl">
+            <button
+              type="button"
+              onClick={() => setHistoryExpanded(!historyExpanded)}
+              className="w-full px-8 py-4 flex justify-between items-center hover:bg-white/20 transition-colors"
+            >
+              <h3 className="text-white text-xl font-bold">
+                History ({cachedCities.length})
+              </h3>
+              <span className="text-white text-2xl">{historyExpanded ? "▼" : "▶"}</span>
+            </button>
+
+            {historyExpanded && (
+              <div className="px-8 py-4 border-t border-white/20 space-y-3">
+                {cachedCities.map((cached) => (
+                  <div
+                    key={`${cached.city.id}_${cached.city.latitude}_${cached.city.longitude}`}
+                    className="flex items-center justify-between bg-white/10 rounded-2xl p-4 hover:bg-white/20 transition-colors"
+                  >
+                    <div className="flex-1">
+                      <p className="text-white font-medium">
+                        {cached.city.name}
+                        {cached.city.admin1 && <span className="text-white/70 text-sm"> - {cached.city.admin1}</span>}
+                      </p>
+                      <p className="text-white/60 text-xs">
+                        {new Date(cached.timestamp * 1000).toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="flex gap-2 ml-4">
+                      <button
+                        type="button"
+                        onClick={() => loadCachedCity(cached)}
+                        className="px-3 py-2 bg-green-500/70 hover:bg-green-600 text-white rounded-lg transition-colors text-sm font-medium"
+                      >
+                        Load
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocation({
+                            latitude: cached.city.latitude,
+                            longitude: cached.city.longitude,
+                            isCurrent: false,
+                          });
+                        }}
+                        className="px-3 py-2 bg-blue-500/70 hover:bg-blue-600 text-white rounded-lg transition-colors text-sm font-medium"
+                      >
+                        Refresh
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeCachedCity(cached)}
+                        className="px-3 py-2 bg-red-500/70 hover:bg-red-600 text-white rounded-lg transition-colors text-sm font-medium"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {loading && (
           <div className="text-center text-white text-xl">Loading weather data...</div>
@@ -278,6 +408,21 @@ function App() {
                   <p className="text-white text-3xl font-semibold">{Math.round(weather.windSpeed)} km/h</p>
                 </div>
               </div>
+
+              {/* Cache button */}
+              <button
+                type="button"
+                onClick={() => handleCacheCity({
+                  id: Math.floor(Math.random() * 1000000),
+                  name: locationName.split(",")[0],
+                  latitude: location!.latitude,
+                  longitude: location!.longitude,
+                  country: locationName.includes(",") ? locationName.split(",")[1].trim() : "",
+                })}
+                className="mt-6 w-full px-6 py-3 bg-purple-500/70 hover:bg-purple-600 text-white rounded-lg font-semibold transition-colors"
+              >
+                Save to Cache
+              </button>
             </div>
 
             {/* 7-day forecast */}
